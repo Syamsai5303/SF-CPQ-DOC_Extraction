@@ -1,0 +1,44 @@
+# Local development stack.
+#   DB only (run the app with `npm run dev`):   docker compose up -d db
+#   Full stack in containers:                   docker compose --profile app up --build
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: cpq_rca
+    ports:
+      - "5433:5432"   # host 5433 avoids clashing with a locally installed PostgreSQL
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d cpq_rca"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    profiles: ["app"]
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      APP_URL: http://localhost:3000
+      DATABASE_URL: postgresql://user:password@db:5432/cpq_rca
+      # Required — set in .env (npm run gen:secrets) or your shell.
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      COOKIE_SECURE: "false"
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:

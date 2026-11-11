@@ -1,0 +1,176 @@
+// CPQ to RCA - data model
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client-js"
+  // "native" for local dev, debian-openssl-3.0.x for the node:22-bookworm-slim container image
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  username     String   @unique
+  passwordHash String   @map("password_hash")
+  // Incremented on password reset / logout-everywhere to invalidate existing JWTs.
+  tokenVersion Int      @default(0) @map("token_version")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Org switcher: the connection the dashboard is currently working against.
+  activeConnectionId String?               @map("active_connection_id")
+  activeConnection   SalesforceConnection? @relation("ActiveConnection", fields: [activeConnectionId], references: [id], onDelete: SetNull)
+
+  // Optional custom logo for generated documents (falls back to client/public/logo.png).
+  logoImage     Bytes?    @map("logo_image")
+  logoMime      String?   @map("logo_mime")
+  logoUpdatedAt DateTime? @map("logo_updated_at")
+
+  salesforceConnections SalesforceConnection[] @relation("UserConnections")
+  passwordResetTokens   PasswordResetToken[]
+  catalogExtractions    CatalogExtraction[]
+  assessmentReports     AssessmentReport[]
+
+  @@map("users")
+}
+
+enum SalesforceAuthType {
+  USERNAME_PASSWORD
+  OAUTH_CLIENT_CREDENTIALS
+}
+
+enum ConnectionStatus {
+  UNVERIFIED
+  ACTIVE
+  FAILED
+}
+
+enum EnvironmentType {
+  PRODUCTION
+  SANDBOX
+  UAT
+  DEVELOPER
+  OTHER
+}
+
+/// One user has many Salesforce org connections (Sandbox, UAT, Production, ...).
+model SalesforceConnection {
+  id              String             @id @default(cuid())
+  userId          String             @map("user_id")
+  user            User               @relation("UserConnections", fields: [userId], references: [id], onDelete: Cascade)
+  name            String // user-chosen alias, unique per user
+  environmentType EnvironmentType    @map("environment_type")
+  authType        SalesforceAuthType @map("auth_type")
+
+  // ---- Non-sensitive metadata (plain text, safe to return to the browser) ----
+  loginUrl   String? @map("login_url") // Option A
+  sfUsername String? @map("sf_username") // Option A input / identity username for both options
+  clientId   String? @map("client_id") // Option B
+  tokenUrl   String? @map("token_url") // Option B
+
+  // ---- Secrets: AES-256-GCM encrypted JSON blob ----
+  // Option A: { password, securityToken }   Option B: { clientSecret }
+  // Format: v1:<iv b64>:<authTag b64>:<ciphertext b64>, AAD bound to userId.
+  encryptedCredentials String @map("encrypted_credentials")
+
+  // ---- Last verification results ----
+  status       ConnectionStatus @default(UNVERIFIED)
+  orgId        String?          @map("org_id")
+  sfUserId     String?          @map("sf_user_id")
+  instanceUrl  String?          @map("instance_url")
+  lastVerified DateTime?        @map("last_verified")
+  lastError    String?          @map("last_error")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  activeFor   User[]              @relation("ActiveConnection")
+  extractions CatalogExtraction[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("salesforce_connections")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // SHA-256 of the raw token. The raw token only ever exists in the emailed link.
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+/// One run of the CPQ catalog extractor against a connection.
+model CatalogExtraction {
+  id           String               @id @default(cuid())
+  userId       String               @map("user_id")
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connectionId String               @map("connection_id")
+  connection   SalesforceConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  status   JobStatus @default(QUEUED)
+  // Live progress: { stage, message, objects: [{ name, status, fetched, total }] }
+  progress Json?
+  // Small, UI-ready digest: KPIs, complexity flags, object inventory.
+  summary  Json?
+
+  // Full hierarchical catalog JSON, gzip-compressed. Never selected in list queries.
+  catalogGz    Bytes? @map("catalog_gz")
+  catalogBytes Int?   @map("catalog_bytes") // uncompressed size
+  recordCount  Int    @default(0) @map("record_count")
+
+  error       String?
+  startedAt   DateTime? @map("started_at")
+  finishedAt  DateTime? @map("finished_at")
+  // Refreshed every 15s by the worker; a stale heartbeat means the worker died.
+  heartbeatAt DateTime? @map("heartbeat_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  assessments AssessmentReport[]
+
+  @@index([connectionId, createdAt])
+  @@index([userId])
+  @@map("catalog_extractions")
+}
+
+/// Gemini-generated RCA migration assessment for one extraction.
+model AssessmentReport {
+  id           String            @id @default(cuid())
+  userId       String            @map("user_id")
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  extractionId String            @map("extraction_id")
+  extraction   CatalogExtraction @relation(fields: [extractionId], references: [id], onDelete: Cascade)
+
+  status       JobStatus @default(QUEUED)
+  model        String
+  markdown     String?
+  progress     Json? // { stage, outputChars }
+  promptTokens Int?      @map("prompt_tokens")
+  outputTokens Int?      @map("output_tokens")
+  error        String?
+  heartbeatAt  DateTime? @map("heartbeat_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  finishedAt   DateTime? @map("finished_at")
+
+  @@index([extractionId, createdAt])
+  @@index([userId])
+  @@map("assessment_reports")
+}

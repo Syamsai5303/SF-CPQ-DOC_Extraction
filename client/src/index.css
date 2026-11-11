@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-brand-50: #eef6ff;
+  --color-brand-100: #d9eaff;
+  --color-brand-500: #1b73d3;
+  --color-brand-600: #0b5cab;
+  --color-brand-700: #084a8a;
+}
