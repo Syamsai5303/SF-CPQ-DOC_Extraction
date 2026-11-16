@@ -15,10 +15,13 @@
  * 4. Serialization: the tree is streamed into gzip piece by piece, never as one giant
  *    JSON string.
  */
+import type { OrgScope } from './orgScopeScanner.ts';
+import { scanOrgScope } from './orgScopeScanner.ts';
 import { once } from 'node:events';
 import { createGzip } from 'node:zlib';
 import {
   CPQ_OBJECTS,
+  CUTOVER_COUNT_OBJECTS,
   EXCLUDED_TRANSACTIONAL,
   SKIPPED_FIELD_TYPES,
   SYSTEM_FIELDS,
@@ -53,6 +56,11 @@ export interface SfConnectionLike {
   describe(name: string): Promise<{ name: string; label: string; fields: DescribeField[] }>;
   query(soql: string): PromiseLike<QueryPage>;
   queryMore(locator: string): PromiseLike<QueryPage>;
+  /** Tooling API (validation rules, installed packages). Optional: probes are skipped without it. */
+  tooling?: { query(soql: string): PromiseLike<QueryPage>; queryMore?(locator: string): PromiseLike<QueryPage> };
+  /** Raw REST call (Analytics report describe). */
+  request?(url: string): PromiseLike<unknown>;
+  version?: string;
 }
 
 export type ObjectStatus = 'pending' | 'running' | 'done' | 'missing' | 'failed' | 'counted';
@@ -79,6 +87,8 @@ export interface ExtractOptions {
   /** Called after every page; keep it cheap (the caller throttles DB writes). */
   onProgress?: (p: ExtractionProgress) => void | Promise<void>;
   signal?: AbortSignal;
+  /** Scan scope outside the catalog (flows, triggers, packages, users…). Default true. */
+  scanOrgScope?: boolean;
 }
 
 export interface SourceInfo {
@@ -88,6 +98,8 @@ export interface SourceInfo {
   instanceUrl: string | null;
   apiVersion: string;
   cpqPackageVersion?: string | null;
+  /** Organization.Name, e.g. the customer's legal entity. */
+  orgName?: string | null;
 }
 
 export interface ObjectInventory {
@@ -207,8 +219,12 @@ export interface RawExtraction {
   data: Record<string, SfRecord[]>;
   inventory: ObjectInventory[];
   otherCpqObjects: Array<{ name: string; label: string; recordCount: number | null }>;
+  /** COUNT() of transactional objects for cut-over planning (records are never read). */
+  cutoverVolumes: Array<{ name: string; label: string; rcaTarget: string; recordCount: number | null }>;
   cpqInstalled: boolean;
   recordCount: number;
+  /** Scope outside the CPQ catalog (automation, documents, packages, users, contracts…). */
+  orgScope?: OrgScope;
 }
 
 export async function extractRaw(conn: SfConnectionLike, opts: ExtractOptions = {}): Promise<RawExtraction> {
@@ -338,10 +354,27 @@ export async function extractRaw(conn: SfConnectionLike, opts: ExtractOptions = 
     otherCpqObjects.push({ name: o.name, label: o.label, recordCount: n });
   }
 
+  // Cut-over volumes: COUNT() only, never records.
+  const cutoverVolumes: RawExtraction['cutoverVolumes'] = [];
+  for (const o of CUTOVER_COUNT_OBJECTS) {
+    if (!available.has(o.name)) continue;
+    let n: number | null = null;
+    try {
+      n = (await conn.query(`SELECT COUNT() FROM ${o.name}`)).totalSize;
+    } catch {
+      n = null;
+    }
+    cutoverVolumes.push({ ...o, recordCount: n });
+  }
+
+  progress.message = 'Checking scope outside the CPQ catalog…';
+  await emit();
+  const orgScope = opts.scanOrgScope === false ? undefined : await scanOrgScope(conn, global.sobjects);
+
   progress.stage = 'building';
   progress.message = 'Assembling hierarchical catalog…';
   await emit();
-  return { data, inventory, otherCpqObjects, cpqInstalled, recordCount };
+  return { data, inventory, otherCpqObjects, cutoverVolumes, cpqInstalled, recordCount, orgScope };
 }
 
 // ------------------------------------------------------------------ assembly
@@ -369,11 +402,19 @@ export interface CpqCatalog {
   discovery: {
     objects: ObjectInventory[];
     otherCpqObjects: RawExtraction['otherCpqObjects'];
+    cutoverVolumes: RawExtraction['cutoverVolumes'];
+    orgScope?: OrgScope;
     excludedTransactionalObjects: string[];
     notes: string[];
   };
   summary: ReturnType<typeof analyzeCatalog>;
-  catalog: { pricebooks: SfRecord[]; products: SfRecord[]; bundleHierarchies: BundleTreeNode[] };
+  catalog: {
+    pricebooks: SfRecord[];
+    products: SfRecord[];
+    bundleHierarchies: BundleTreeNode[];
+    /** Records whose parent bundle product was not extracted (e.g. deleted/inaccessible products). */
+    orphans: { features: number; options: number; optionConstraints: number; configurationAttributes: number };
+  };
   rules: { productRules: SfRecord[]; priceRules: SfRecord[]; summaryVariables: SfRecord[] };
   pricing: { discountSchedules: SfRecord[]; contractedPriceCount: number };
   customizations: {
@@ -406,6 +447,14 @@ export function assembleCatalog(raw: RawExtraction, source: SourceInfo, opts: Ex
   const constraintsByBundle = groupBy(d.optionConstraints, 'bundle');
   const attrsByBundle = groupBy(d.configurationAttributes, 'bundle');
   const cfgRulesByBundle = groupBy(d.configurationRules, 'bundle');
+
+  const orphanCount = (records: SfRecord[]) => records.filter((r) => r.links?.bundle && !productsById.has(r.links.bundle)).length;
+  const orphans = {
+    features: orphanCount(d.features),
+    options: orphanCount(d.options),
+    optionConstraints: orphanCount(d.optionConstraints),
+    configurationAttributes: orphanCount(d.configurationAttributes),
+  };
 
   for (const p of products) {
     const pricing: Record<string, SfRecord[]> = {};
@@ -486,6 +535,9 @@ export function assembleCatalog(raw: RawExtraction, source: SourceInfo, opts: Ex
     'Bundle "levels" counts product tiers: a bundle with plain options = 2, a bundle containing a bundle = 3+.',
   ];
   if (budget.nodes <= 0) notes.push('Bundle hierarchy expansion hit its size budget; deeper repeats appear as {ref: true} nodes.');
+  if (orphans.options || orphans.features) {
+    notes.push(`${orphans.options} option(s) and ${orphans.features} feature(s) reference bundle products that were not extracted (deleted, archived or not visible to the integration user); they are counted but not placed in the hierarchy.`);
+  }
   const truncated = raw.inventory.filter((i) => i.truncated).map((i) => i.name);
   if (truncated.length) notes.push(`Record cap reached (partial data) for: ${truncated.join(', ')}.`);
 
@@ -497,11 +549,13 @@ export function assembleCatalog(raw: RawExtraction, source: SourceInfo, opts: Ex
     discovery: {
       objects: raw.inventory,
       otherCpqObjects: raw.otherCpqObjects,
+      cutoverVolumes: raw.cutoverVolumes ?? [],
+      orgScope: raw.orgScope,
       excludedTransactionalObjects: EXCLUDED_TRANSACTIONAL,
       notes,
     },
     summary: undefined as unknown as CpqCatalog['summary'],
-    catalog: { pricebooks: d.pricebooks, products, bundleHierarchies },
+    catalog: { pricebooks: d.pricebooks, products, bundleHierarchies, orphans },
     rules: { productRules: d.productRules, priceRules: d.priceRules, summaryVariables: d.summaryVariables },
     pricing: { discountSchedules: d.discountSchedules, contractedPriceCount },
     customizations: {

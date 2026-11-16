@@ -171,7 +171,76 @@ integration user can view setup.
     and unreadable objects.
   - A severity-weighted score (0–100) gives the overall level: Low, Medium, High or Very High.
 
-### 4. AI assessment (`geminiService.ts`, `docGenerator.ts`)
+### 4. CPQ Assessment & RCA Migration Report (`reportModel.ts`, `geminiService.ts`, `docGenerator.ts`)
+
+One report merges the **CPQ Configuration Document** (current state, item by item) with the **RCA
+Migration Assessment** (mapping, gaps, roadmap), duplicates removed:
+
+| Part | Sections | Fact tables (generated from the extraction) |
+| --- | --- | --- |
+| **1. Executive Summary & Current CPQ Architecture** | 1.1 Executive summary · 1.2 Key findings · 1.3 Catalog structure | Footprint & effort (total CPQ configuration records, items assessed by area), key findings (severity / area / action), bundle inventory with per-bundle approach, feature/option outline |
+| **2. Price Rules & Product Rules Breakdown** | 2.1 Product rules · 2.2 Price rules · 2.3 Supporting logic & dependencies | **Every product rule explained in plain English** (what it does, when it runs, the message it shows); **one block per price rule**: purpose, trigger / evaluation event, conditions, actions, RCA approach; summary variables & discount tiers |
+| **3. CPQ-to-RCA Mapping Matrix & Migration Strategy** | 3.1 Mapping matrix · 3.2 Approach & effort · 3.3 Gap analysis · 3.4 Roadmap · 3.5 Risks & questions · 3.6 Dependencies outside the CPQ catalog | Direct/Adapt/Redesign/Retire by area with indicative hours, cut-over volumes, dependencies outside the catalog (Area / Found in this org / Why it matters) |
+| **Appendices** | A. Custom fields used by CPQ logic · B. Record inventory · C. Complexity indicators · D. Rule logic (exact conditions/actions with API names) | All generated |
+
+**How it is produced:**
+
+- **Plain-English rule explanations** come from `ruleExplainer.ts`, not the AI, so they are exact and
+  cover every rule. Field API names become labels (`SBQQ__ProductFamily__c` → "Product Family"),
+  operators become words, and `IF(…)` formulas read as "0.1 if Quote Subscription Term ≥ 12,
+  otherwise 0.05". Lookup-table rules name the table and the matching columns. Examples:
+  - *Validation:* "Blocks the user from saving for Starter PKG-START when Configuration
+    Attributes Employee Count is greater than 100, showing: "…""
+  - *Selection:* "When Data Migration Required is 'Yes', the configurator automatically adds
+    IMPL-SETUP (the user cannot deselect it)."
+  - *Price rule:* "During quote calculation (on calculation), when Product Code is 'SUB-PRO',
+    sets the quote line's Discount (%) to 0.1 if Quote Subscription Term ≥ 12, otherwise 0.05."
+- **Price rules (2.2)** are one table: Price rule | Purpose | Trigger / evaluation event |
+  Conditions | Actions | Approach. Gemini writes the one-line business purpose per rule; the
+  report moves it into the Purpose column. Everything else comes from `ruleExplainer.ts`.
+- **Custom actions:** CPQ-packaged actions (they call a built-in CPQ action, are package
+  defaults, or reference `SBQQ` in their name, page, URL or flow) are excluded from the effort
+  and counted separately; only org-built actions are migration items.
+- **Org scope scan (3.6 + Appendix E):** each extraction also runs read-only probes for scope
+  outside the catalog (`orgScopeScanner.ts`): flows, Apex triggers and validation rules on
+  quoting objects; every custom and twin field on Quote / Quote Line; quote templates, sections
+  and terms; installed packages (CPQ, Advanced Approvals, Billing); multi-currency and
+  translations; Apex classes referencing CPQ (and those making callouts), named credentials,
+  connected apps, the 150 most recently run reports and the dashboards built on them; active
+  users, CPQ licences and permission sets; RCA objects and licences; active subscriptions,
+  contracts, renewal and amendment quotes. Section 3.6 shows Area | Found in this org | Why it
+  matters; full lists are in Appendix E. A probe the integration user cannot run is shown as
+  *Could not be checked: <reason>*, never as zero. For full results the integration user needs
+  **API Enabled**, **View Setup and Configuration** (Tooling API: validation rules, packages)
+  and **View All Data** (Apex source, reports).
+- **Pagination:** headings are never left at the bottom of a page, and a table's header always
+  stays with its first row (PDF: measured keep-with-next; DOCX: repeating header row with
+  `cantSplit` + `keepNext`).
+- Gemini writes only the analysis. The prompt is a compact skeleton of fixed headings plus
+  `{{PLACEHOLDER}}` markers.
+- `reportModel.ts` replaces each marker with a table built from the extraction. A table the model
+  forgot is inserted into its own Part, so no fact table is ever lost.
+- Every count, rule condition and effort figure is therefore exact, and the AI output is about 40%
+  shorter. A 600-product org takes about 20 s and 3k output tokens.
+- **Approach per item** follows the CPQ Configuration Document:
+  - **Retire:** inactive items.
+  - **Redesign:** QCP, guided selling, circular or externally configured bundles, and
+    lookup/formula price rules with more than 5 conditions or actions.
+  - **Adapt:** nested or dynamic bundles, rules using lookups, summary variables, custom logic or
+    filters, price rules, account-specific schedules, and custom actions.
+  - **Direct:** everything else.
+- **Indicative effort:** 2 / 6 / 24 / 0.5 h per item (Direct / Adapt / Redesign / Retire). This is
+  configuration rebuild only; calibrate after the first wave.
+- **Documents (DOCX and PDF):**
+  - a cover with organisation, org ID, environment, CPQ version, extraction time, complexity and
+    "Prepared by" (`REPORT_PREPARED_BY`)
+  - a contents page, and each Part starting on a new page
+  - the logo and title header on every page, and a branded "Page X of Y" footer
+  - High/Medium/Low and Direct/Adapt/Redesign/Retire cells colour-coded, and column widths sized
+    to content
+- Reports generated before this template keep their original layout when downloaded.
+
+#### AI generation details
 
 - The full catalog can be far larger than any prompt. Gemini gets a **bounded digest** (≤ ~600k
   characters, shrunk automatically when needed) containing:
@@ -744,6 +813,7 @@ For Amazon SES SMTP: `SMTP_HOST=email-smtp.<region>.amazonaws.com`, `SMTP_PORT=5
 | `CPQ_MAX_CONCURRENT_EXTRACTIONS` | | `2` | Per instance |
 | `CPQ_KEEP_EXTRACTIONS` | | `10` | History kept per connection |
 | `CPQ_DEMO_ORG` / `CPQ_DEMO_PRODUCTS` | | off / `3000` | Development only: synthetic CPQ org |
+| `REPORT_PREPARED_BY` | | `Streamforce Solutions` | "Prepared by" on the report cover and footer |
 
 ## Branding
 

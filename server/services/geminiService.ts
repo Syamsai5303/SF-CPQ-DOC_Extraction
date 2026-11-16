@@ -11,6 +11,8 @@ import '../config.js'; // loads .env before GEMINI_* are read
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import type { ThinkingConfig } from '@google/genai';
 import type { CpqCatalog, SfRecord } from './cpqCatalogExtractor.ts';
+import { isPackagedCustomAction } from './cpqAnalysis.ts';
+import { approachSummary, classifyItems, fieldReferences, PLACEHOLDERS } from './reportModel.ts';
 
 /**
  * Model selection. Google retires model versions for new API keys over time (e.g.
@@ -135,6 +137,31 @@ export interface DigestLimits {
 }
 
 const DEFAULT_LIMITS: DigestLimits = { bundles: 40, optionsPerFeature: 12, rules: 250, conditionsPerRule: 8, schedules: 60, scriptChars: 6_000 };
+
+/** Counts-only view of the org scope scan for the prompt (lists stay in Appendix E). */
+function scopeDigest(catalog: CpqCatalog) {
+  const o = catalog.discovery.orgScope;
+  if (!o) return null;
+  const v = <T, R>(p: { status: string; data?: T }, f: (d: T) => R) => (p.status === 'ok' && p.data !== undefined ? f(p.data) : 'not checked');
+  return {
+    flowsOnQuotingObjects: v(o.automation.flows, (d) => d.map((f) => `${f.label} (${f.object})`).slice(0, 10)),
+    apexTriggers: v(o.automation.apexTriggers, (d) => d.map((t) => `${t.name} (${t.object})`).slice(0, 10)),
+    validationRules: v(o.automation.validationRules, (d) => d.length),
+    quoteCustomFields: v(o.quoteFields, (d) => ({ quote: d.quote.length, quoteLine: d.quoteLine.length, twinFields: d.twins.map((t) => t.field).slice(0, 10) })),
+    quoteTemplates: v(o.documents, (d) => d.templates.length),
+    packages: v(o.packages, (d) => d.map((p) => `${p.name} ${p.version}`)),
+    advancedApprovals: v(o.approvals, (d) => (d.installed ? { rules: d.rules, chains: d.chains } : 'not installed')),
+    billingInstalled: o.billing.installed,
+    currency: v(o.currency, (d) => (d.multiCurrency ? d.currencies : 'single')),
+    apexClassesReferencingCpq: v(o.integrations.apexClasses, (d) => ({ count: d.referencingCpq.length, withCallouts: d.withCallouts.length })),
+    reportsOnCpq: v(o.integrations.reports, (d) => d.referencingCpq.length),
+    namedCredentials: v(o.integrations.namedCredentials, (d) => d.length),
+    activeUsers: v(o.users.activeUsers, (d) => d),
+    cpqPermissionSetAssignments: v(o.users.permissionSets, (d) => d.reduce((t, p) => t + p.assignees, 0)),
+    rcaObjectsPresent: o.rca.objectsPresent,
+    inFlight: v(o.subscriptions, (d) => d),
+  };
+}
 
 export function buildAssessmentDigest(catalog: CpqCatalog, limits: DigestLimits = DEFAULT_LIMITS) {
   const productsById = new Map(catalog.catalog.products.map((p) => [p.Id, p]));
@@ -265,8 +292,27 @@ export function buildAssessmentDigest(catalog: CpqCatalog, limits: DigestLimits 
     contractedPriceRecords: catalog.pricing.contractedPriceCount,
     customScripts: scripts,
     pluginSettings: catalog.customizations.pluginSettings.map((p) => compact(Object.fromEntries(Object.entries(p).filter(([k]) => k.startsWith('SBQQ__'))))),
-    customActions: catalog.customizations.customActions.map((a) => compact({ name: a.Name, location: a.SBQQ__Location__c, type: a.SBQQ__Type__c, active: a.SBQQ__Active__c })),
+    customActions: catalog.customizations.customActions.filter((a) => !isPackagedCustomAction(a)).map((a) => compact({ name: a.Name, location: a.SBQQ__Location__c, type: a.SBQQ__Type__c, active: a.SBQQ__Active__c })),
     guidedSellingProcesses: catalog.customizations.guidedSelling.length,
+    orphanedRecords: catalog.catalog.orphans,
+    cutoverVolumes: (catalog.discovery.cutoverVolumes ?? []).map((v) => ({ object: v.label, records: v.recordCount })),
+    orgScope: scopeDigest(catalog),
+    // Same classification the report tables use, so narrative and tables agree.
+    migrationApproach: (() => {
+      const items = classifyItems(catalog);
+      const summary = approachSummary(items);
+      return {
+        byArea: summary.rows,
+        total: { ...summary.total, personDays: summary.personDays },
+        nonDirectItems: items
+          .filter((i) => i.approach !== 'Direct')
+          .slice(0, 80)
+          .map((i) => ({ item: i.name, type: i.type, approach: i.approach, reason: i.reason })),
+      };
+    })(),
+    customFieldsUsedByLogic: fieldReferences({ catalog, items: [] })
+      .slice(0, 40)
+      .map((r) => ({ field: r.field, usedBy: r.usedBy.length })),
   };
 
   // Shrink progressively if a huge catalog still exceeds the character budget.
@@ -286,50 +332,64 @@ export function buildAssessmentDigest(catalog: CpqCatalog, limits: DigestLimits 
 
 // ------------------------------------------------------------------ prompt
 
-export const SYSTEM_INSTRUCTION = `You are a principal Salesforce Revenue Cloud architect who has led many migrations from Salesforce CPQ (SBQQ managed package) to Revenue Cloud Advanced (RCA: Product Catalog Management, Salesforce Pricing with Pricing Procedures, Expression Sets and Decision Tables, the Product Configurator with Constraint Modeling Language, Product Discovery, Transaction Management).
-
-You write executive-ready migration assessments grounded strictly in the data provided.
-
+export const SYSTEM_INSTRUCTION = `You are a principal Salesforce architect writing a CPQ Assessment & RCA Migration Report: current-state Salesforce CPQ (SBQQ) first, then the move to Revenue Cloud Advanced (Product Catalog Management, Pricing Procedures, Expression Sets, Decision Tables, Advanced Configurator with CML, Product Discovery, Transaction Line Editor).
 Rules:
-- Use ONLY the numbers, names and facts in the provided JSON. Never invent counts, object names or rule names. When something is unknown, say so and list it under open questions.
-- Quote record names exactly (e.g. bundle or rule names) when giving examples.
-- Be specific about RCA constructs (e.g. "Product Related Component", "Product Component Group", "Pricing Procedure", "Expression Set", "Decision Table", "Product Selling Model", "Attribute Definition", "CML constraint").
-- Output GitHub-flavoured Markdown only: headings, paragraphs, bullet/numbered lists and pipe tables. No HTML, no images, and do not wrap the document in a code fence.
-- Keep table cells short (one sentence max); put detail in prose below the table.`;
+- Use only facts from the JSON digest; quote record names exactly. If something is unknown, say so under open questions.
+- The system inserts fact tables at each {{PLACEHOLDER}}: put each placeholder on its own line exactly where the skeleton shows it and do not repeat its numbers in tables of your own.
+- Use the digest's migrationApproach labels (Direct/Adapt/Redesign/Retire) consistently.
+- GitHub-flavoured Markdown only (headings, short paragraphs, bullets, pipe tables). No HTML, no LaTeX or $…$ math (write ≤, ≥, ×), no code fences around the document, table cells under 25 words.
+- Write for business stakeholders: plain business terms first, field API names only where essential.
+- Be specific and concise: an expert reader, no filler.`;
 
+/** Report skeleton. Headings are fixed; <…> are writing instructions for the model. */
 export function buildAssessmentPrompt(digest: ReturnType<typeof buildAssessmentDigest>, orgLabel: string) {
-  return `Produce an RCA Migration Assessment for the Salesforce org "${orgLabel}" using the CPQ configuration digest below.
+  const { level, score } = digest.complexity;
+  return `Write the report for "${orgLabel}". Output exactly this skeleton, keeping headings verbatim and replacing each <…> with content:
 
-Use exactly this structure and these headings:
+# Part 1. Executive Summary & Current CPQ Architecture
+## 1.1 Executive summary
+<2 short paragraphs: readiness (complexity ${level}, ${score}/100), its main drivers, and the headline recommendation.>
+{{FOOTPRINT}}
+## 1.2 Key findings
+{{KEY_FINDINGS}}
+## 1.3 Catalog structure
+<How the current catalog is organised: product families, standalone SKUs vs bundles, multi-level nesting, features/options patterns, attributes, pricing methods. 1-2 paragraphs and up to 5 bullets.>
+{{BUNDLE_TABLE}}
+{{BUNDLE_STRUCTURE}}
 
-# RCA Migration Assessment: ${orgLabel}
+# Part 2. Price Rules & Product Rules Breakdown
+## 2.1 Product rules
+<Overview of the configuration business logic by rule type (Validation, Selection, Alert, Filter; skip absent types): what each group enforces and how the rules interact. The table below explains every rule individually, so do not restate rules one by one.>
+{{PRODUCT_RULE_TABLE}}
+## 2.2 Price rules
+<1 short paragraph on the pricing flow in evaluation-event order (On Initialization → Before Calculate → On Calculate → After Calculate) and how the rules combine. Then one bullet per price rule: "- **<exact rule name>**: <the pricing behaviour it automates, in business terms (who benefits and why), max 25 words>". The system moves each bullet into that rule's block, which already lists trigger, conditions and actions, so give no raw metadata.>
+{{PRICE_RULE_TABLE}}
+## 2.3 Supporting logic & dependencies
+<Summary variables, discount schedules, option constraints, rule chains and shared custom fields, QCP methods, custom actions. Call out items that must migrate together.>
+{{SUPPORTING_LOGIC}}
 
-## 1. Executive Overview & Catalog Footprint
-- 2–3 paragraph executive summary: overall readiness, the complexity rating (${digest.complexity.level}, score ${digest.complexity.score}/100) and its main drivers, and a headline recommendation.
-- A "Catalog Footprint" table (Metric | Value) with the key KPIs.
-- Effort outlook as T-shirt sizes per workstream (Catalog, Configuration Rules, Pricing, Custom Code/QCP, Data Migration, Testing) with one-line justification each.
+# Part 3. CPQ-to-RCA Mapping Matrix & Migration Strategy
+## 3.1 Mapping matrix
+<Table: CPQ Construct | Volume | RCA Equivalent | Approach | Risk. One row per construct present in this org, then one sentence listing constructs not used.>
+## 3.2 Migration approach & effort
+{{APPROACH_SUMMARY}}
+<2-4 sentences interpreting where the effort sits.>
+## 3.3 Gap analysis
+<Table: Gap | CPQ pattern (named examples) | RCA workaround | Risk, highest risk first. Then a short "Retire / simplify" bullet list.>
+## 3.4 Phased migration roadmap
+<Table: Phase | Scope | Key activities | Exit criteria for: Design; Catalog foundation; Configuration rules; Pricing; Custom logic & UI; Data migration & cut-over; Testing & hypercare. Then 3 bullets on test strategy: quote parity, rule regression, performance.>
+{{CUTOVER_VOLUMES}}
+## 3.5 Risks, assumptions & open questions
+<Risk table (Risk | Impact | Mitigation), at most 9 rows. It must include: change management & user training (use digest.orgScope.activeUsers); RCA licensing & org prerequisites; running CPQ and RCA side by side during cut-over; renewals/amendments of in-flight subscriptions; hidden automation (flows/triggers/validation rules) and integrations/reports on SBQQ fields when digest.orgScope shows any. Then short bullet lists of assumptions and questions for the customer.>
+## 3.6 Dependencies outside the CPQ catalog
+{{BLIND_SPOTS}}
 
-## 2. RCA Mapping Matrix
-A table with columns: CPQ Construct | Volume in this org | RCA Equivalent | Migration Approach | Effort (Low/Medium/High).
-Cover at minimum: products & product families, bundles/features/options, nested bundles, option constraints, configuration attributes, product rules by type (validation/alert/selection/filter), configuration rules, price rules + conditions + actions, lookup queries/lookup objects, summary variables, discount schedules & tiers, block pricing, cost-plus, percent-of-total, MDQ/price dimensions, contracted/account pricing, custom scripts (QCP), custom actions/search filters, guided selling, price books & entries. Write "Not used" for constructs with zero volume rather than omitting them.
-After the table, add short subsections for the three highest-effort mappings explaining the target RCA design.
-
-## 3. Modernization & Gap Analysis
-- For each complexity flag (severity high first), explain the CPQ pattern found, why it does not translate 1:1, and the recommended RCA architectural workaround. Reference concrete examples by name.
-- A "Retire / Simplify" list (e.g. inactive rules, redundant constraints) with justification.
-- QCP analysis: methods implemented and what each must become in RCA.
-
-## 4. Phased Migration Strategy
-Numbered phases (Discovery & Design; Catalog Foundation; Configuration Rules; Pricing; Custom Logic; Data Migration & Cutover; Testing & Hypercare). For each phase: objectives, key activities, entry/exit criteria, dependencies. Include a test strategy: parity testing of priced quotes between CPQ and RCA, rule regression packs, and performance tests for the largest bundles.
-
-## 5. Risks, Assumptions & Open Questions
-A table (Risk | Impact | Mitigation), then bullet lists of assumptions and questions for the customer.
-
-CPQ configuration digest (JSON):
-\`\`\`json
-${JSON.stringify(digest)}
-\`\`\``;
+Digest (JSON):
+${JSON.stringify(digest)}`;
 }
+
+/** Placeholder keys the prompt asks for (used by tests to keep prompt and renderer in sync). */
+export const PROMPT_PLACEHOLDERS = PLACEHOLDERS.map((p) => p.key);
 
 // ------------------------------------------------------------------ generation
 

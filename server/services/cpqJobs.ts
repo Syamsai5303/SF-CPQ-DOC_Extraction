@@ -13,6 +13,7 @@ import { DecryptionError } from '../lib/crypto.js';
 import { extractCpqCatalog, serializeCatalogGzip } from './cpqCatalogExtractor.ts';
 import type { CpqCatalog, ExtractionProgress, SfConnectionLike } from './cpqCatalogExtractor.ts';
 import { GEMINI_MODEL, generateAssessment } from './geminiService.ts';
+import { assembleReport } from './reportModel.ts';
 
 const MAX_RECORDS_PER_OBJECT = Number(process.env.CPQ_MAX_RECORDS_PER_OBJECT) || 250_000;
 const MAX_CONCURRENT_EXTRACTIONS = Number(process.env.CPQ_MAX_CONCURRENT_EXTRACTIONS) || 2;
@@ -122,6 +123,7 @@ export function summaryOf(catalog: CpqCatalog) {
     complexity: catalog.summary.complexity,
     inventory: catalog.discovery.objects,
     otherCpqObjects: catalog.discovery.otherCpqObjects,
+    cutoverVolumes: catalog.discovery.cutoverVolumes ?? [],
     excludedTransactionalObjects: catalog.discovery.excludedTransactionalObjects,
     notes: catalog.discovery.notes,
   };
@@ -136,6 +138,15 @@ type JsforceConn = {
   queryMore(locator: string): PromiseLike<unknown>;
   tooling: { query(soql: string): PromiseLike<{ records: Array<Record<string, unknown>> }> };
 };
+
+async function organizationName(conn: JsforceConn): Promise<string | null> {
+  try {
+    const res = (await conn.query('SELECT Name FROM Organization LIMIT 1')) as { records?: Array<{ Name?: string }> };
+    return res.records?.[0]?.Name ?? null;
+  } catch {
+    return null;
+  }
+}
 
 async function cpqPackageVersion(conn: JsforceConn): Promise<string | null> {
   try {
@@ -202,15 +213,18 @@ async function runExtraction(
     let conn: JsforceConn;
     let info: { orgId: string | null; instanceUrl: string | null };
     let version: string | null;
+    let orgName: string | null = null;
     if (DEMO_ORG) {
       // Dev-only demo mode: a synthetic CPQ org instead of Salesforce (see README).
       const { createFakeCpqOrg } = await import('./testing/fakeCpqOrg.ts');
       conn = createFakeCpqOrg({ products: Number(process.env.CPQ_DEMO_PRODUCTS) || 3_000, bundles: 300 }) as unknown as JsforceConn;
       info = { orgId: '00DDEMO00000001', instanceUrl: 'https://demo.my.salesforce.com' };
       version = '258.1 (demo)';
+      orgName = 'Acme Corporation (demo)';
     } else {
       ({ conn, info } = (await openSavedConnection(record)) as { conn: JsforceConn; info: { orgId: string; instanceUrl: string } });
       version = await cpqPackageVersion(conn);
+      orgName = await organizationName(conn);
     }
 
     const catalog = await extractCpqCatalog(
@@ -222,6 +236,7 @@ async function runExtraction(
         instanceUrl: info.instanceUrl ?? connection.instanceUrl,
         apiVersion: API_VERSION,
         cpqPackageVersion: version,
+        orgName,
       },
       { includeInactive, maxRecordsPerObject: MAX_RECORDS_PER_OBJECT, onProgress: writeProgress, signal },
     );
@@ -316,15 +331,17 @@ async function runAssessment(id: string, extractionId: string, signal: AbortSign
           .catch(() => {});
       },
     });
+    // AI narrative + generated fact tables (placeholders expanded) + deterministic appendices.
+    const markdown = assembleReport(result.markdown, catalog);
     await prisma.assessmentReport.update({
       where: { id },
       data: {
         status: 'SUCCEEDED',
-        markdown: result.markdown,
+        markdown,
         model: result.model,
         promptTokens: result.promptTokens,
         outputTokens: result.outputTokens,
-        progress: { stage: 'done', outputChars: result.markdown.length, finishReason: result.finishReason, attempts: result.attempts } as object,
+        progress: { stage: 'done', outputChars: markdown.length, finishReason: result.finishReason, attempts: result.attempts } as object,
         finishedAt: new Date(),
       },
     });

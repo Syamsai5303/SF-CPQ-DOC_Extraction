@@ -90,10 +90,15 @@ export function createFakeCpqOrg(opts: FakeOrgOptions = {}) {
   put('SBQQ__SummaryVariable__c', { Id: id('a0S', 1), Name: 'Total Hardware Qty', SBQQ__AggregateFunction__c: 'Sum', SBQQ__AggregateField__c: 'Quantity', SBQQ__TargetObject__c: 'Quote Line' });
   for (let r = 0; r < 50; r++) {
     const ruleId = id('a0R', r);
-    put('SBQQ__ProductRule__c', { Id: ruleId, Name: `Product Rule ${r}`, SBQQ__Type__c: ['Validation', 'Alert', 'Selection', 'Filter'][r % 4], SBQQ__Active__c: r % 9 !== 0, SBQQ__EvaluationEvent__c: 'Load;Edit;Save', SBQQ__ConditionsMet__c: r % 7 === 0 ? 'Custom' : 'All', SBQQ__AdvancedCondition__c: r % 7 === 0 ? '1 AND (2 OR 3)' : null, SBQQ__LookupObject__c: r % 11 === 0 ? 'Lookup_Data__c' : null, ...audit });
+    put('SBQQ__ProductRule__c', { Id: ruleId, Name: `Product Rule ${r}`, SBQQ__Type__c: ['Validation', 'Alert', 'Selection', 'Filter'][r % 4], SBQQ__Active__c: r % 9 !== 0, SBQQ__EvaluationEvent__c: 'Load;Edit;Save', SBQQ__ConditionsMet__c: r % 7 === 0 ? 'Custom' : 'All', SBQQ__AdvancedCondition__c: r % 7 === 0 ? '1 AND (2 OR 3)' : null, SBQQ__LookupObject__c: r % 11 === 0 ? 'Lookup_Data__c' : null, SBQQ__ErrorMessage__c: r % 4 === 0 ? 'Quantity must not exceed 1 for this bundle.' : r % 4 === 1 ? 'Consider adding the support package.' : null, ...audit });
     const nCond = r % 13 === 0 ? 7 : 2;
     for (let c = 0; c < nCond; c++) put('SBQQ__ErrorCondition__c', { Id: id('a0E', r * 10 + c), SBQQ__Rule__c: ruleId, SBQQ__TestedObject__c: 'Product Option', SBQQ__TestedField__c: 'SBQQ__Quantity__c', SBQQ__Operator__c: 'greater than', SBQQ__FilterValue__c: '1', SBQQ__TestedVariable__c: c === 0 && r === 0 ? id('a0S', 1) : null });
-    put('SBQQ__ProductAction__c', { Id: id('a0P', r), SBQQ__Rule__c: ruleId, SBQQ__Product__c: id('01t', nBundles + r), SBQQ__Type__c: 'Add', SBQQ__Required__c: true });
+    const ruleType = ['Validation', 'Alert', 'Selection', 'Filter'][r % 4];
+    if (ruleType === 'Selection') {
+      put('SBQQ__ProductAction__c', { Id: id('a0P', r), SBQQ__Rule__c: ruleId, SBQQ__Product__c: id('01t', nBundles + r), SBQQ__Type__c: r % 8 === 2 ? 'Add' : 'Disable & Remove', SBQQ__Required__c: true });
+    } else if (ruleType === 'Filter') {
+      put('SBQQ__ProductAction__c', { Id: id('a0P', r), SBQQ__Rule__c: ruleId, SBQQ__FilterField__c: 'Family', SBQQ__Operator__c: 'equals', SBQQ__FilterValue__c: 'Hardware' });
+    }
     if (r < nBundles) put('SBQQ__ConfigurationRule__c', { Id: id('a0G', r), SBQQ__Product__c: id('01t', r), SBQQ__ProductRule__c: ruleId, SBQQ__Active__c: true });
   }
   for (let r = 0; r < 40; r++) {
@@ -118,10 +123,32 @@ export function createFakeCpqOrg(opts: FakeOrgOptions = {}) {
   // ---- customizations
   put('SBQQ__CustomScript__c', { Id: id('a0J', 1), Name: 'MyQCP', SBQQ__Code__c: 'export function onBeforeCalculate(quote, lines, conn) {\n  return Promise.resolve();\n}\n', SBQQ__TranspiledCode__c: 'var x=1;', SBQQ__QuoteLineFields__c: 'SBQQ__ListPrice__c' });
   put('SBQQ__Plugins__c', { Id: id('a0Y', 1), SBQQ__QuoteCalculator__c: 'MyQCP', SetupOwnerId: id('00D', 1) });
-  put('SBQQ__CustomAction__c', { Id: id('a0M', 1), Name: 'Add Favorites', SBQQ__Active__c: true, SBQQ__Location__c: 'Quote' });
+  put('SBQQ__CustomAction__c', { Id: id('a0M', 1), Name: 'Add Favorites', SBQQ__Active__c: true, SBQQ__Location__c: 'Quote', SBQQ__Action__c: null, SBQQ__URL__c: '/apex/FavoritesPicker' });
+  put('SBQQ__CustomAction__c', { Id: id('a0M', 2), Name: 'Renew Subscriptions', SBQQ__Active__c: true, SBQQ__Location__c: 'Quote', SBQQ__Action__c: 'Renew Subscriptions', SBQQ__URL__c: null });
+  put('SBQQ__CustomAction__c', { Id: id('a0M', 3), Name: 'Calculate', SBQQ__Active__c: true, SBQQ__Location__c: 'Quote', SBQQ__Action__c: null, SBQQ__URL__c: '/apex/SBQQ__sb' });
   put('SBQQ__CustomActionCondition__c', { Id: id('a0N', 1), SBQQ__CustomAction__c: id('a0M', 1), SBQQ__Field__c: 'SBQQ__Status__c' });
   put('SBQQ__Theme__c', { Id: id('a0H', 1), Name: 'Default' });
-  put('SBQQ__Quote__c', { Id: id('a0q', 1), Name: 'Q-0001' });
+  // Options/features whose bundle product no longer exists (orphans), as seen in real orgs.
+  put('SBQQ__ProductFeature__c', { Id: id('a0F', 900_000), Name: 'Orphan feature', SBQQ__ConfiguredSKU__c: id('01t', 9_999_999), SBQQ__Number__c: 10 });
+  for (let i = 0; i < 3; i++) put('SBQQ__ProductOption__c', { Id: id('a0O', 900_000 + i), SBQQ__ConfiguredSKU__c: id('01t', 9_999_999), SBQQ__OptionalSKU__c: id('01t', nBundles), SBQQ__Number__c: i + 1 });
+  // Transactional objects: only ever COUNT()-ed by the extractor.
+  for (let i = 0; i < 42; i++) put('SBQQ__Quote__c', { Id: id('a0q', 100 + i), Name: `Q-${i}` });
+  for (let i = 0; i < 9; i++) put('SBQQ__Subscription__c', { Id: id('a0s', i), Name: `SUB-${i}` });
+  for (let i = 0; i < 6; i++) put('Contract', { Id: id('800', i), ContractNumber: `${i}` });
+  put('SBQQ__Quote__c', { Id: id('a0q', 1), Name: 'Q-0001', Region__c: 'EMEA' });
+  // Quote customisation, templates and Advanced Approvals (scope signals, never extracted).
+  put('SBQQ__QuoteLine__c', { Id: id('a0l', 1), Name: 'QL-1', Billing_Frequency__c: 'Annual', Margin_Band__c: 'A' });
+  put('OpportunityLineItem', { Id: id('00k', 1), Billing_Frequency__c: 'Annual' });
+  put('SBQQ__QuoteTemplate__c', { Id: id('a0T', 1), Name: 'Standard Proposal' });
+  put('SBQQ__QuoteTemplate__c', { Id: id('a0T', 2), Name: 'Renewal Quote' });
+  put('sbaa__ApprovalRule__c', { Id: id('a0A', 1), Name: 'Discount > 20%' });
+  put('sbaa__ApprovalChain__c', { Id: id('a0B', 1), Name: 'Finance chain' });
+  put('SBQQ__TemplateSection__c', { Id: id('a0U', 1), Name: 'Line items' });
+  put('SBQQ__QuoteTerm__c', { Id: id('a0V', 1), Name: 'Payment terms' });
+  put('SBQQ__Localization__c', { Id: id('a0W', 1), Name: 'fr: Starter' });
+  put('CurrencyType', { Id: id('01L', 1), IsoCode: 'USD', IsCorporate: true, IsActive: true });
+  put('CurrencyType', { Id: id('01L', 2), IsoCode: 'EUR', IsCorporate: false, IsActive: true });
+  put('ProductSellingModel', { Id: id('0jP', 1), Name: 'Term Monthly' });
 
   const omit = new Set(opts.omitObjects ?? ['SBQQ__Dimension__c', 'SBQQ__QuoteProcess__c', 'SBQQ__ProcessInput__c', 'SBQQ__SearchFilter__c']);
   const objectNames = [...new Set([...Object.keys(tables), 'SBQQ__ProductRule__c'])].filter((n) => !omit.has(n));
@@ -161,6 +188,67 @@ export function createFakeCpqOrg(opts: FakeOrgOptions = {}) {
     return { records: slice, done, nextRecordsUrl: done ? undefined : `/services/data/v62.0/query/${key}-${c.offset}`, totalSize: c.rows.length };
   };
 
+  /** Canned answers for the org scope scan (metadata the fake doesn't model as tables). */
+  const SCOPE: Array<[RegExp, Rec[] | number]> = [
+    [/FROM FlowDefinitionView/, [
+      { Id: 'f1', ApiName: 'Quote_Sync_To_Opportunity', Label: 'Quote sync to opportunity', ProcessType: 'AutoLaunchedFlow', TriggerType: 'RecordAfterSave', TriggerObjectOrEventId: 'SBQQ__Quote__c', NamespacePrefix: null },
+      { Id: 'f2', ApiName: 'Order_Activation', Label: 'Order activation', ProcessType: 'AutoLaunchedFlow', TriggerType: 'RecordAfterSave', TriggerObjectOrEventId: 'Order', NamespacePrefix: null },
+      { Id: 'f3', ApiName: 'Case_Routing', Label: 'Case routing', ProcessType: 'AutoLaunchedFlow', TriggerType: 'RecordBeforeSave', TriggerObjectOrEventId: 'Case', NamespacePrefix: null },
+    ]],
+    [/FROM ApexTrigger/, [
+      { Id: 't1', Name: 'QuoteLineTrigger', TableEnumOrId: '01I000000000001', NamespacePrefix: null },
+      { Id: 't2', Name: 'AccountTrigger', TableEnumOrId: 'Account', NamespacePrefix: null },
+    ]],
+    [/FROM NamedCredential/, [{ Id: 'n1', DeveloperName: 'ERP_Orders', Endpoint: 'https://erp.example.com' }]],
+    [/FROM ConnectedApplication/, [{ Id: 'c1', Name: 'Billing Middleware' }]],
+    [/FROM ApexClass/, [
+      { Id: 'a1', Name: 'QuoteToErpSync', Body: 'public class QuoteToErpSync { void run(SBQQ__Quote__c q){ HttpRequest r = new HttpRequest(); } }' },
+      { Id: 'a2', Name: 'QuoteLineHelper', Body: 'public class QuoteLineHelper { SBQQ__QuoteLine__c l; }' },
+      { Id: 'a3', Name: 'Utils', Body: 'public class Utils {}' },
+    ]],
+    [/FROM Report /, [
+      { Id: '00O1', Name: 'Quotes by rep', FolderName: 'Sales' },
+      { Id: '00O2', Name: 'Pipeline', FolderName: 'Sales' },
+    ]],
+    [/COUNT\(\) FROM Dashboard$/, 7],
+    [/FROM DashboardComponent/, [{ Id: 'd1', DashboardId: '01Z1', CustomReportId: '00O1' }]],
+    [/COUNT\(\) FROM User WHERE/, 48],
+    [/GROUP BY LanguageLocaleKey/, [{ Id: 'g1', LanguageLocaleKey: 'en_US', users: 40 }, { Id: 'g2', LanguageLocaleKey: 'fr', users: 8 }]],
+    [/FROM Organization/, [{ Id: '00D', LanguageLocaleKey: 'en_US' }]],
+    [/FROM PackageLicense/, [{ Id: 'l1', NamespacePrefix: 'SBQQ', AllowedLicenses: 50, UsedLicenses: 42 }]],
+    [/FROM PermissionSet WHERE/, [
+      { Id: '0PS1', Name: 'SalesforceCPQ_CPQStandardPerm', Label: 'Salesforce CPQ User', NamespacePrefix: 'SBQQ' },
+      { Id: '0PS2', Name: 'SalesforceCPQ_CPQAdminPerm', Label: 'Salesforce CPQ Admin', NamespacePrefix: 'SBQQ' },
+    ]],
+    [/FROM PermissionSetAssignment/, [{ Id: 'g3', PermissionSetId: '0PS1', n: 40 }, { Id: 'g4', PermissionSetId: '0PS2', n: 3 }]],
+    [/FROM PermissionSetLicense/, [{ Id: 'p1', MasterLabel: 'Salesforce CPQ License', TotalLicenses: 50, UsedLicenses: 42 }, { Id: 'p2', MasterLabel: 'Sales Cloud', TotalLicenses: 100, UsedLicenses: 60 }]],
+    [/SBQQ__EndDate__c >= TODAY/, 7],
+    [/SBQQ__EndDate__c = NEXT_N_DAYS:90/, 2],
+    [/EndDate >= TODAY/, 5],
+    [/EndDate = NEXT_N_DAYS:180/, 2],
+    [/SBQQ__Evergreen__c/, 1],
+    [/GROUP BY SBQQ__Type__c/, [{ Id: 'g5', SBQQ__Type__c: 'Quote', n: 30 }, { Id: 'g6', SBQQ__Type__c: 'Renewal', n: 8 }, { Id: 'g7', SBQQ__Type__c: 'Amendment', n: 5 }]],
+  ];
+  const TOOLING: Array<[RegExp, Rec[]]> = [
+    [/FROM ValidationRule/, [
+      { Id: 'v1', ValidationName: 'Discount_Requires_Reason', EntityDefinitionId: '01I000000000002', ErrorMessage: 'Enter a discount reason', NamespacePrefix: null },
+      { Id: 'v2', ValidationName: 'Close_Date_Required', EntityDefinitionId: 'Opportunity', ErrorMessage: 'Close date required', NamespacePrefix: null },
+    ]],
+    [/FROM InstalledSubscriberPackage/, [
+      { Id: 'i1', SubscriberPackage: { NamespacePrefix: 'SBQQ', Name: 'Salesforce CPQ' }, SubscriberPackageVersion: { MajorVersion: 252, MinorVersion: 4, PatchVersion: 0 } },
+      { Id: 'i2', SubscriberPackage: { NamespacePrefix: 'sbaa', Name: 'Advanced Approvals' }, SubscriberPackageVersion: { MajorVersion: 232, MinorVersion: 1, PatchVersion: 0 } },
+    ]],
+  ];
+  const ENTITY_IDS: Record<string, string> = { '01I000000000001': 'SBQQ__QuoteLine__c', '01I000000000002': 'SBQQ__Quote__c' };
+  const answer = (rows: Rec[] | number) => (typeof rows === 'number' ? { records: [], done: true, totalSize: rows } : { records: rows, done: true, totalSize: rows.length });
+  const scopeAnswer = (soql: string) => {
+    if (/FROM EntityDefinition/.test(soql)) {
+      return answer(Object.entries(ENTITY_IDS).filter(([k]) => soql.includes(k)).map(([DurableId, QualifiedApiName]) => ({ Id: DurableId, DurableId, QualifiedApiName })));
+    }
+    const hit = SCOPE.find(([re]) => re.test(soql));
+    return hit ? answer(hit[1]) : null;
+  };
+
   const conn: SfConnectionLike & { stats: typeof stats } = {
     stats,
     async describeGlobal() {
@@ -173,6 +261,8 @@ export function createFakeCpqOrg(opts: FakeOrgOptions = {}) {
     },
     async query(soql: string) {
       stats.queries++;
+      const scripted = scopeAnswer(soql);
+      if (scripted) return scripted;
       const m = /^SELECT (.+?) FROM (\w+)(?: WHERE (\w+) = true)?$/.exec(soql);
       if (!m) throw new Error(`MALFORMED_QUERY: ${soql}`);
       const [, select, obj, activeField] = m;
@@ -187,6 +277,20 @@ export function createFakeCpqOrg(opts: FakeOrgOptions = {}) {
       const key = `c${++cursorSeq}`;
       cursors.set(key, { rows, fields, offset: 0 });
       return page(key);
+    },
+    tooling: {
+      async query(soql: string) {
+        const hit = TOOLING.find(([re]) => re.test(soql));
+        if (!hit) throw new Error(`INVALID_TYPE: ${soql}`);
+        return answer(hit[1]);
+      },
+    },
+    version: '62.0',
+    async request(url: string) {
+      const reportId = /reports\/(\w+)\/describe/.exec(url)?.[1];
+      return reportId === '00O1'
+        ? { reportMetadata: { reportType: { type: 'SBQQ__Quote__c', label: 'Quotes' }, detailColumns: ['SBQQ__Quote__c.SBQQ__NetAmount__c'] } }
+        : { reportMetadata: { reportType: { type: 'Opportunity', label: 'Opportunities' }, detailColumns: ['AMOUNT'] } };
     },
     async queryMore(locator: string) {
       stats.queryMores++;

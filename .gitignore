@@ -150,3 +150,6 @@ vite.config.ts.timestamp-*
 
 # Keep the env template
 !.env.example
+
+# Locally generated sample reports
+sample-output/

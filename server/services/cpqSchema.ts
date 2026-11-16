@@ -340,6 +340,19 @@ export const CPQ_OBJECTS: ObjectSpec[] = [
   },
 ];
 
+/**
+ * Transactional volumes for cut-over planning. Only COUNT() is run on these: no
+ * transactional record is ever read.
+ */
+export const CUTOVER_COUNT_OBJECTS: Array<{ name: string; label: string; rcaTarget: string }> = [
+  { name: 'SBQQ__Quote__c', label: 'Quote', rcaTarget: 'Quote / QuoteLineItem' },
+  { name: 'SBQQ__QuoteLine__c', label: 'Quote Line', rcaTarget: 'QuoteLineItem + QuoteLineRelationship' },
+  { name: 'Contract', label: 'Contract', rcaTarget: 'Contract' },
+  { name: 'SBQQ__Subscription__c', label: 'Subscription', rcaTarget: 'Asset + AssetStatePeriod / AssetActionSource' },
+  { name: 'Asset', label: 'Asset', rcaTarget: 'Asset + AssetStatePeriod' },
+  { name: 'Order', label: 'Order', rcaTarget: 'Order / OrderItem (Dynamic Revenue Orchestrator)' },
+];
+
 /** Transactional objects: never extracted. Listed in the output so the exclusion is explicit. */
 export const EXCLUDED_TRANSACTIONAL = [
   'SBQQ__Quote__c',

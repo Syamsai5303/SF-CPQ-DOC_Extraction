@@ -37,7 +37,21 @@ function distribution(records: SfRecord[], field: string): Record<string, number
 
 type BundleInfo = { options: SfRecord[]; features: SfRecord[]; optionConstraints: SfRecord[]; configurationAttributes: SfRecord[]; levels?: number; circularReference?: boolean };
 
+/**
+ * True for custom actions that ship with / belong to the CPQ package rather than being built
+ * by the org: they invoke a built-in CPQ action, are package defaults, or reference SBQQ in
+ * their name, page, URL or flow. They are replaced by standard RCA functions, so they are not
+ * counted as migration items.
+ */
+export function isPackagedCustomAction(a: SfRecord): boolean {
+  if (a.SBQQ__Default__c === true) return true;
+  if (typeof a.SBQQ__Action__c === 'string' && a.SBQQ__Action__c.trim()) return true;
+  const text = [a.Name, a.SBQQ__Page__c, a.SBQQ__URL__c, a.SBQQ__Flow__c].map((v) => (v == null ? '' : String(v))).join(' ');
+  return /SBQQ/i.test(text);
+}
+
 export function analyzeCatalog(catalog: Pick<CpqCatalog, 'catalog' | 'rules' | 'pricing' | 'customizations' | 'discovery'>) {
+  const orphans = catalog.catalog.orphans ?? { features: 0, options: 0, optionConstraints: 0, configurationAttributes: 0 };
   const products = catalog.catalog.products;
   const bundles = products.filter((p) => p.bundle);
   const bundleOf = (p: SfRecord) => p.bundle as BundleInfo;
@@ -48,7 +62,9 @@ export function analyzeCatalog(catalog: Pick<CpqCatalog, 'catalog' | 'rules' | '
 
   const { productRules, priceRules, summaryVariables } = catalog.rules;
   const { discountSchedules } = catalog.pricing;
-  const { customScripts, pluginSettings, customActions } = catalog.customizations;
+  const { customScripts, pluginSettings } = catalog.customizations;
+  const packagedActions = catalog.customizations.customActions.filter(isPackagedCustomAction);
+  const customActions = catalog.customizations.customActions.filter((a) => !isPackagedCustomAction(a));
 
   const allOptions = bundles.flatMap((b) => bundleOf(b).options);
   const allFeatures = bundles.flatMap((b) => bundleOf(b).features);
@@ -74,12 +90,17 @@ export function analyzeCatalog(catalog: Pick<CpqCatalog, 'catalog' | 'rules' | '
     discountSchedules: discountSchedules.length,
     features: allFeatures.length,
     options: allOptions.length,
+    // Records whose bundle product wasn't extracted; included in the object inventory counts.
+    orphanFeatures: orphans.features,
+    orphanOptions: orphans.options,
     optionConstraints: allConstraints.length,
     configurationAttributes: allConfigAttrs.length,
     pricebooks: catalog.catalog.pricebooks.length,
     pricebookEntries: pricebookEntryCount,
     summaryVariables: summaryVariables.length,
     customScripts: customScripts.length,
+    customActions: customActions.length,
+    packagedCustomActions: packagedActions.length,
     maxBundleLevels: maxLevels,
   };
 
@@ -314,7 +335,7 @@ export function analyzeCatalog(catalog: Pick<CpqCatalog, 'catalog' | 'rules' | '
     id: 'custom-actions',
     severity: 'low',
     title: 'Custom actions & search filters',
-    detail: `${customActions.length} custom action(s) in the quote line editor / configurator.`,
+    detail: `${customActions.length} org-built custom action(s) in the quote line editor / configurator${packagedActions.length ? ` (${packagedActions.length} CPQ-packaged actions excluded)` : ''}.`,
     count: customActions.length,
     rcaGuidance: 'Rebuild as Lightning actions or Transaction Line Editor customizations.',
     examples: pick(customActions).map((a) => example(a)),
@@ -339,6 +360,16 @@ export function analyzeCatalog(catalog: Pick<CpqCatalog, 'catalog' | 'rules' | '
     detail: `${products.length.toLocaleString()} products and ${allOptions.length.toLocaleString()} options.`,
     count: volumeIssues ? 1 : 0,
     rcaGuidance: 'Use bulk data loads (Bulk API 2.0 / Data Loader) and stage the catalog migration by product family.',
+    examples: [],
+  });
+
+  add({
+    id: 'orphaned-configuration',
+    severity: 'low',
+    title: 'Orphaned bundle configuration',
+    detail: `${orphans.options} option(s) and ${orphans.features} feature(s) point to bundle products that were not extracted (deleted, archived or not visible to the integration user).`,
+    count: orphans.options + orphans.features,
+    rcaGuidance: 'Confirm whether the parent products still exist; clean up or exclude orphaned records instead of migrating them.',
     examples: [],
   });
 
